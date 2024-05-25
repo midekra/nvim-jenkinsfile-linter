@@ -1,69 +1,53 @@
 local Job = require("plenary.job")
 local log = require("plenary.log").new({ plugin = "jenkinsfile-linter", level = "info" })
 
-local user = os.getenv("JENKINS_USER_ID") or os.getenv("JENKINS_USERNAME")
-local password = os.getenv("JENKINS_PASSWORD")
-local token = os.getenv("JENKINS_API_TOKEN") or os.getenv("JENKINS_TOKEN")
+local jenkins_password = os.getenv("JENKINS_PASSWORD")
+local jenkins_token = os.getenv("JENKINS_API_TOKEN") or os.getenv("JENKINS_TOKEN")
 local jenkins_url = os.getenv("JENKINS_URL") or os.getenv("JENKINS_HOST")
+local jenkins_user = os.getenv("JENKINS_USER_ID") or os.getenv("JENKINS_USERNAME")
+local jenkins_validation_url = jenkins_url .. "/pipeline-model-converter/validate"
 local namespace_id = vim.api.nvim_create_namespace("jenkinsfile-linter")
-local insecure = os.getenv("JENKINS_INSECURE") and "--insecure" or ""
 local validated_msg = "Jenkinsfile successfully validated."
-local unauthorized_msg = "ERROR 401 Unauthorized"
-local not_found_msg = "ERROR 404 Not Found"
 
-local function get_crumb_job()
-  return Job:new({
+
+local function validate_job()
+  -- Buffers to collect the output and errors
+  local result = {}
+  local errors = {}
+
+  -- Execute the curl command asynchronously using plenary.job
+  Job:new({
     command = "curl",
     args = {
-      insecure,
+      "--silent",
       "--user",
-      user .. ":" .. (token or password),
-      jenkins_url .. "/crumbIssuer/api/json",
+      string.format("%s:%s", jenkins_user, jenkins_token or jenkins_password),
+      "-X",
+      "POST",
+      jenkins_validation_url,
+      "-F",
+      string.format("jenkinsfile=<%s", vim.fn.expand("%:p")),
     },
-  })
-end
+    on_stdout = function(_, line)
+      table.insert(result, line)
+    end,
+    on_stderr = function(_, line)
+      table.insert(errors, line)
+    end,
+    on_exit = function(j, return_val)
+      vim.schedule(function()
+        if return_val == 0 then
+          -- Join all lines to form the full result string
+          local full_result = table.concat(result, "\n")
 
-local validate_job = vim.schedule_wrap(function(crumb_job)
-  local concatenated_crumbs = table.concat(crumb_job._stdout_results, " ")
-  if string.find(concatenated_crumbs, unauthorized_msg) then
-    log.error("Unable to authorize to get breadcrumb. Please check your creds")
-  elseif string.find(concatenated_crumbs, not_found_msg) then
-    log.error("Unable to hit your crumb provider. Please check your host")
-  else
-    local args = vim.fn.json_decode(concatenated_crumbs)
+          -- Remove leading and trailing whitespace
+          full_result = full_result:gsub("^%s+", ""):gsub("%s+$", "")
 
-    return Job:new({
-      command = "curl",
-      args = {
-        insecure,
-        "--user",
-        user .. ":" .. (token or password),
-        "-X",
-        "POST",
-        "-H",
-        "Jenkins-Crumb:" .. args.crumb,
-        "-F",
-        "jenkinsfile=<" .. vim.fn.expand("%:p"),
-        jenkins_url .. "/pipeline-model-converter/validate",
-      },
-
-      on_stderr = function(err, _)
-        if err then
-          log.error(err)
-        end
-      end,
-      on_stdout = vim.schedule_wrap(function(err, data)
-        if not err then
-          if data == validated_msg then
-            vim.diagnostic.reset(namespace_id, 0)
-            vim.notify(validated_msg, vim.log.levels.INFO)
+          -- Validate result
+          if full_result == validated_msg then
+            vim.notify(full_result, vim.log.levels.INFO)
           else
-            -- We only want to grab the msg, line, and col. We just throw
-            -- everything else away. NOTE: That only one seems to ever be
-            -- returned so this in theory will only ever match at most once per
-            -- call.
-            --WorkflowScript: 46: unexpected token: } @ line 46, column 1.
-            local msg, line_str, col_str = data:match("WorkflowScript.+%d+: (.+) @ line (%d+), column (%d+).")
+            local msg, line_str, col_str = full_result:match("WorkflowScript.+%d+: (.+) @ line (%d+), column (%d+).")
             if line_str and col_str then
               local line = tonumber(line_str) - 1
               local col = tonumber(col_str) - 1
@@ -76,28 +60,41 @@ local validate_job = vim.schedule_wrap(function(crumb_job)
                 end_col = col,
                 severity = vim.diagnostic.severity.ERROR,
                 message = msg,
-                source = "jenkinsfile linter",
+                source = "jenkinsfile validation",
               }
 
               vim.diagnostic.set(namespace_id, vim.api.nvim_get_current_buf(), { diag })
+              vim.notify(full_result, vim.log.levels.ERROR)
+            else
+              -- Get the last line
+              local last_line = ""
+              for line in full_result:gmatch("[^\r\n]+") do
+                  last_line = line
+              end
+
+              vim.notify(validated_msg .. "\n\n" .. last_line, vim.log.levels.WARN)
+              local full_error = table.concat(errors, "\n")
+              vim.notify(full_error, vim.log.levels.ERROR)
             end
           end
         else
-          vim.notify("Something went wront when trying to valide your file, check the logs.", vim.log.levels.ERROR)
-          log.error(err)
+          -- Join and notify error messages
+          local full_error = table.concat(errors, "\n")
+          vim.notify("Failed to validate Jenkinsfile:\n\n" .. full_error, vim.log.levels.ERROR)
+          log.error(full_error)
         end
-      end),
-    }):start()
-  end
-end)
+      end)
+    end,
+  }):start()
+end
 
 local function check_creds()
-  if user == nil then
+  if jenkins_user == nil then
     return false, "JENKINS_USER_ID is not set, please set it"
-  elseif password == nil and token == nil then
-    return false, "JENKINS_PASSWORD or JENKINS_API_TOKEN need to be set, please set one"
+  elseif jenkins_password == nil and jenkins_token == nil then
+    return false, "JENKINS_PASSWORD or JENKINS_API_TOKEN need to be set."
   elseif jenkins_url == nil then
-    return false, "JENKINS_URL is not set, please set it"
+    return false, "JENKINS_URL is not set."
   else
     return true
   end
@@ -106,9 +103,10 @@ end
 local function validate()
   local ok, msg = check_creds()
   if ok then
-    get_crumb_job():after(validate_job):start()
+    validate_job()
   else
     vim.notify(msg, vim.log.levels.ERROR)
+    log.error(msg)
   end
 end
 
